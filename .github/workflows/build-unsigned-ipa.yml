@@ -1,0 +1,57 @@
+name: Build Unsigned IPA
+
+on:
+  workflow_dispatch: # 允许在 Actions 页面手动触发
+  push:
+    branches: [ main ]
+    paths:
+      - '**.swift'
+      - '**.xcodeproj/**'
+      - '**.xcworkspace/**'
+      - '.github/workflows/build-unsigned-ipa.yml'
+
+jobs:
+  build:
+    runs-on: macos-latest # 使用最新的 macOS Runner（如 macOS 14/15）
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Show Xcode Version
+        run: xcodebuild -version
+        
+      - name: List Schemes
+        run: xcodebuild -list -project Legado.xcodeproj        
+
+      - name: Build and Archive (Unsigned)
+        run: |
+          xcodebuild archive \
+            -project "Legado.xcodeproj" \
+            -scheme "Legado" \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            ONLY_ACTIVE_ARCH=NO
+
+      - name: Package Unsigned IPA
+        run: |
+          # 从归档中提取 .app 并手动打包成标准的 Payload/ 结构
+          mkdir -p "$RUNNER_TEMP/Payload"
+          cp -R "$RUNNER_TEMP/App.xcarchive/Products/Applications/"*.app "$RUNNER_TEMP/Payload/"
+          
+          # 使用 ditto 打包，能更好地保留符号链接等文件属性
+          cd "$RUNNER_TEMP"
+          ditto -c -k --sequesterRsrc --keepParent Payload \
+            "Legado-unsigned.ipa"
+
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Legado-Unsigned-IPA
+          path: ${{ runner.temp }}/Legado-unsigned.ipa
+          if-no-files-found: error
