@@ -428,15 +428,17 @@ extension View {
 }
 
 private struct ReadingUIKitConfiguration: UIViewControllerRepresentable {
-    let configure: (UIViewController) -> Void
+    // 回调仅在 viewWillAppear / viewDidLayoutSubviews（主线程）同步执行，
+    // 标记 @MainActor 以便闭包内合法访问 UIView / UIViewController 的隔离属性。
+    let configure: @MainActor (UIViewController) -> Void
 
     func makeUIViewController(context: Context) -> Controller { Controller(configure: configure) }
     func updateUIViewController(_ controller: Controller, context: Context) { controller.configure = configure }
 
     final class Controller: UIViewController {
-        var configure: (UIViewController) -> Void
+        var configure: @MainActor (UIViewController) -> Void
 
-        init(configure: @escaping (UIViewController) -> Void) {
+        init(configure: @escaping @MainActor (UIViewController) -> Void) {
             self.configure = configure
             super.init(nibName: nil, bundle: nil)
         }
