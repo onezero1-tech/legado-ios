@@ -36,6 +36,7 @@ struct ReaderView: View {
     @State private var showsContentEditor = false
     @State private var editedContent = ""
     @State private var contentEditError: String?
+    @State private var readerSettingSaveError: String?
     @State private var backgroundImage: UIImage?
     @State private var backgroundError: String?
     @State private var showsBackgroundPicker = false
@@ -229,8 +230,57 @@ struct ReaderView: View {
             }
         }
         .animation(.easeOut(duration: 0.22), value: showsReaderMenu)
-        .onAppear { handleReaderAppear() }
-        .onDisappear { handleReaderDisappear() }
+        .alert("阅读设置未保存", isPresented: readerSettingErrorPresented(inSettings: false)) {
+            Button("好", role: .cancel) { readerSettingSaveError = nil }
+        } message: { Text(readerSettingSaveError ?? "") }
+        .onAppear {
+            activity.beginReading(book)
+            speech.onNextChapter = { moveSpeechToChapter(direction: 1) }
+            speech.onPreviousChapter = { moveSpeechToChapter(direction: -1) }
+            speech.onRemoteStop = {
+                speechTimerTask?.cancel()
+                speechTimerRemaining = 0
+                resumesSpeechAfterChapterLoad = false
+            }
+            UIDevice.current.isBatteryMonitoringEnabled = true
+            brightnessBeforeReading = Double(UIScreen.main.brightness)
+            if storedReaderBrightness > 0.05 {
+                followsSystemBrightness = false
+                readerBrightness = storedReaderBrightness
+                UIScreen.main.brightness = CGFloat(storedReaderBrightness)
+            } else {
+                readerBrightness = brightnessBeforeReading
+            }
+            backgroundImage = ReaderBackgroundStore.load()
+            ReaderScreenOrientation.apply(screenOrientation)
+            Task { await loadHTTPEngines() }
+            if ProcessInfo.processInfo.arguments.contains("-uiDemoBookmarks") {
+                showsBookmarks = true
+            }
+            if ProcessInfo.processInfo.arguments.contains("-uiDemoReaderMenu") {
+                showsReaderMenu = true
+            }
+            if ProcessInfo.processInfo.arguments.contains("-uiDemoReaderStyle") {
+                DispatchQueue.main.async { showsStyleControls = true }
+            }
+        }
+        .onDisappear {
+            isAutoReading = false
+            UIApplication.shared.isIdleTimerDisabled = false
+            if speech.isSpeaking || speech.isPaused { speech.toggle(text: "") }
+            saveProgress(immediate: true)
+            ReaderScreenOrientation.restoreApplicationDefault()
+            activity.cancelReading(book)
+            UIDevice.current.isBatteryMonitoringEnabled = false
+            if !followsSystemBrightness {
+                UIScreen.main.brightness = CGFloat(brightnessBeforeReading)
+            }
+            speechTimerTask?.cancel()
+            speechTimerRemaining = 0
+            speech.onNextChapter = nil
+            speech.onPreviousChapter = nil
+            speech.onRemoteStop = nil
+        }
         .overlay(alignment: .bottom) {
             if showsReaderMenu {
                 readerBottomChrome
@@ -248,7 +298,18 @@ struct ReaderView: View {
         .sheet(item: $sourceSwitchBook) { currentBook in
             ReadingNavigationStack {
                 SourceSwitchView(book: currentBook, sources: sourceLibrary.sources) { report, source in
-                    Task { await applySourceSwitchReport(report, source: source) }
+                    await progressSaveTask?.value
+                    if library.contains(book) {
+                        guard await library.commitSourceSwitch(oldBookURL: book.bookUrl, report: report) else { return false }
+                    }
+                    await activity.endReading(book)
+                    model.applySourceSwitch(report, source: source)
+                    readerPosition = report.book.durChapterPos
+                    readerJumpPosition = nil
+                    readerPageRanges = []
+                    readerRenderRevision &+= 1
+                    activity.beginReading(report.book)
+                    return true
                 }
             }
         }
@@ -259,10 +320,40 @@ struct ReaderView: View {
         .sheet(isPresented: $showsClickActionSettings) { clickActionSettings }
         .sheet(isPresented: $showsContentEditor) { contentEditor }
         .task(id: model.chapterLoadGeneration) {
-            await handleChapterLoad()
+            isWaitingForNextChapter = false
+            isWaitingForPreviousChapter = false
+            let needsInitialPosition = !model.hasLoadedCurrentChapter
+            if let pending = progressSaveTask {
+                let pendingGeneration = progressSaveGeneration
+                await pending.value
+                // A newer page callback may have scheduled another save while
+                // this chapter task was waiting. Never erase that newer task's
+                // handle, or a subsequent chapter transition could skip it.
+                if progressSaveGeneration == pendingGeneration {
+                    progressSaveTask = nil
+                }
+            }
+            readerJumpPosition = nil
+            readerPageRanges = []
+            if needsInitialPosition { readerPosition = model.requestedPosition }
+            await model.load(rules: model.usesReplaceRules ? replaceRules.rules : [], prefetchNextChapter: pageAnimation != 3)
+            guard !Task.isCancelled else { return }
+            if needsInitialPosition {
+                readerPosition = pageAnimation == 3
+                    ? continuousPosition(model.requestedPosition, content: model.content)
+                    : min(model.requestedPosition, max(model.content.utf16.count - 1, 0))
+            }
+            if let chapter = model.currentChapter {
+                await library.updateProgress(for: book, chapter: chapter, position: readerPosition)
+            }
+            if resumesSpeechAfterChapterLoad, !model.content.isEmpty {
+                resumesSpeechAfterChapterLoad = false
+                startConfiguredSpeech()
+            }
         }
-        .task(id: continuousReadingTaskKey) {
-            await prepareContinuousReadingIfNeeded()
+        .task(id: "\(model.chapterLoadGeneration):\(pageAnimation == 3):\(model.hasLoadedCurrentChapter):\(model.scrollRevision)") {
+            guard pageAnimation == 3 else { return }
+            await model.prepareContinuousReading(rules: model.usesReplaceRules ? replaceRules.rules : [])
         }
         .onAppear { updateIdleTimer() }
         .onChange(of: keepScreenOn) { _ in
@@ -333,7 +424,7 @@ struct ReaderView: View {
             totalPages = 1
             UserDefaults.standard.set(value, forKey: "pageAnim")
             let updatedBook = model.useGlobalPageAnimation()
-            Task { await library.addOrUpdate(updatedBook) }
+            saveReaderSetting(updatedBook) { $0.pageAnim = -1 }
         }
     }
 
@@ -422,9 +513,9 @@ struct ReaderView: View {
             Button {
                 Task {
                     if pageAnimation == 3, model.scrollChapters.contains(where: { $0.id == model.currentIndex }) {
-                        await model.retryContinuousChapter(index: model.currentIndex, rules: activeRules)
+                        await model.retryContinuousChapter(index: model.currentIndex, rules: model.usesReplaceRules ? replaceRules.rules : [])
                     } else {
-                        await model.load(rules: activeRules, forceRefresh: true)
+                        await model.load(rules: model.usesReplaceRules ? replaceRules.rules : [], forceRefresh: true)
                     }
                 }
             } label: {
@@ -484,7 +575,7 @@ struct ReaderView: View {
                 loadingAhead: model.isLoadingScrollAhead,
                 loadingBehind: model.isLoadingScrollBehind,
                 onNeedChapters: { direction in
-                    Task { await model.extendContinuousReading(direction: direction, rules: activeRules) }
+                    Task { await model.extendContinuousReading(direction: direction, rules: model.usesReplaceRules ? replaceRules.rules : []) }
                 },
                 onPositionChanged: { index, position in
                     if index != model.currentIndex {
@@ -980,7 +1071,7 @@ struct ReaderView: View {
     private func requestNextChapter() {
         if pageAnimation == 3 {
             guard model.canGoNext else { isAutoReading = false; return }
-            Task { await model.extendContinuousReading(direction: 1, rules: activeRules) }
+            Task { await model.extendContinuousReading(direction: 1, rules: model.usesReplaceRules ? replaceRules.rules : []) }
             return
         }
         guard model.canGoNext, model.hasContinuationWindow else {
@@ -1510,10 +1601,9 @@ struct ReaderView: View {
             showsContentEditor = true
         case 9:
             showsReaderMenu = false
+            stopSpeechForContentChange()
             let updatedBook = model.toggleReplaceRules(position: readerPosition)
-            Task {
-                await library.addOrUpdate(updatedBook)
-            }
+            saveReaderSetting(updatedBook) { $0.useReplaceRule = updatedBook.readConfig?.useReplaceRule }
         case 10:
             showsReaderMenu = false
             showsTableOfContents = true
@@ -1538,6 +1628,16 @@ struct ReaderView: View {
             Form {
                 Section {
                     Toggle("两端对齐", isOn: $fullJustify)
+                    Toggle("重新分段", isOn: Binding(
+                        get: { model.usesParagraphResegmentation },
+                        set: { value in
+                            guard value != model.usesParagraphResegmentation else { return }
+                            stopSpeechForContentChange()
+                            let updatedBook = model.toggleParagraphResegmentation(position: readerPosition)
+                            saveReaderSetting(updatedBook) { $0.reSegment = value }
+                        }
+                    ))
+                    .accessibilityIdentifier("readerResegmentToggle")
                     Button("编辑本章正文", systemImage: "square.and.pencil") {
                         editedContent = model.content
                         contentEditError = nil
@@ -1635,6 +1735,9 @@ struct ReaderView: View {
             }
             .navigationTitle("阅读设置")
             .navigationBarTitleDisplayMode(.inline)
+            .alert("阅读设置未保存", isPresented: readerSettingErrorPresented(inSettings: true)) {
+                Button("好", role: .cancel) { readerSettingSaveError = nil }
+            } message: { Text(readerSettingSaveError ?? "") }
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("完成") { showsReaderSettings = false }
@@ -1929,128 +2032,6 @@ struct ReaderView: View {
     }
 
 
-    /// 当前生效的净化规则。
-    /// 独立成计算属性：「方法(参数: 三元表达式)」是新 Xcode 上类型检查超时的常见来源，统一收敛到一处。
-    private var activeRules: [ReplaceRule] {
-        model.usesReplaceRules ? replaceRules.rules : []
-    }
-
-    /// 滚动模式下连续阅读的重排任务 key。
-    /// 独立成计算属性，避免 .task(id:) 的大字符串插值表达式导致类型检查超时。
-    private var continuousReadingTaskKey: String {
-        "\(model.chapterLoadGeneration):\(pageAnimation == 3):\(model.hasLoadedCurrentChapter):\(model.scrollRevision)"
-    }
-
-    /// 滚动模式下预加载前后章以支撑连续阅读。
-    private func prepareContinuousReadingIfNeeded() async {
-        guard pageAnimation == 3 else { return }
-        let rules = activeRules
-        await model.prepareContinuousReading(rules: rules)
-    }
-
-    /// 章节加载任务：等待在途存档、加载正文并同步进度。
-    /// 独立成方法，避免 task 闭包表达式过大导致类型检查超时。
-    private func handleChapterLoad() async {
-        isWaitingForNextChapter = false
-        isWaitingForPreviousChapter = false
-        let needsInitialPosition = !model.hasLoadedCurrentChapter
-        if let pending = progressSaveTask {
-            let pendingGeneration = progressSaveGeneration
-            await pending.value
-            // A newer page callback may have scheduled another save while
-            // this chapter task was waiting. Never erase that newer task's
-            // handle, or a subsequent chapter transition could skip it.
-            if progressSaveGeneration == pendingGeneration {
-                progressSaveTask = nil
-            }
-        }
-        readerJumpPosition = nil
-        readerPageRanges = []
-        if needsInitialPosition { readerPosition = model.requestedPosition }
-        await model.load(rules: activeRules, prefetchNextChapter: pageAnimation != 3)
-        guard !Task.isCancelled else { return }
-        if needsInitialPosition {
-            readerPosition = pageAnimation == 3
-                ? continuousPosition(model.requestedPosition, content: model.content)
-                : min(model.requestedPosition, max(model.content.utf16.count - 1, 0))
-        }
-        if let chapter = model.currentChapter {
-            await library.updateProgress(for: book, chapter: chapter, position: readerPosition)
-        }
-        if resumesSpeechAfterChapterLoad, !model.content.isEmpty {
-            resumesSpeechAfterChapterLoad = false
-            startConfiguredSpeech()
-        }
-    }
-
-    /// 换源完成后的收尾：保存进度、替换书籍并重置排版。
-    /// 独立成方法，避免 sheet 嵌套闭包过大导致类型检查超时。
-    private func applySourceSwitchReport(_ report: BookSourceSwitchReport, source: BookSource) async {
-        await progressSaveTask?.value
-        await activity.endReading(book)
-        await library.replace(oldBookURL: book.bookUrl, with: report.book)
-        model.applySourceSwitch(report, source: source)
-        readerPosition = report.book.durChapterPos
-        readerJumpPosition = nil
-        readerPageRanges = []
-        readerRenderRevision &+= 1
-        activity.beginReading(report.book)
-    }
-
-    /// 阅读器退出时的清理逻辑。
-    /// 独立成方法，避免 onDisappear 闭包表达式过大导致类型检查超时。
-    private func handleReaderDisappear() {
-        isAutoReading = false
-        UIApplication.shared.isIdleTimerDisabled = false
-        if speech.isSpeaking || speech.isPaused { speech.toggle(text: "") }
-        saveProgress(immediate: true)
-        ReaderScreenOrientation.restoreApplicationDefault()
-        activity.cancelReading(book)
-        UIDevice.current.isBatteryMonitoringEnabled = false
-        if !followsSystemBrightness {
-            UIScreen.main.brightness = CGFloat(brightnessBeforeReading)
-        }
-        speechTimerTask?.cancel()
-        speechTimerRemaining = 0
-        speech.onNextChapter = nil
-        speech.onPreviousChapter = nil
-        speech.onRemoteStop = nil
-    }
-
-    /// 阅读器首次出现时的配置逻辑。
-    /// 独立成方法，避免 onAppear 闭包表达式过大导致类型检查超时。
-    private func handleReaderAppear() {
-        activity.beginReading(book)
-        speech.onNextChapter = { moveSpeechToChapter(direction: 1) }
-        speech.onPreviousChapter = { moveSpeechToChapter(direction: -1) }
-        speech.onRemoteStop = {
-            speechTimerTask?.cancel()
-            speechTimerRemaining = 0
-            resumesSpeechAfterChapterLoad = false
-        }
-        UIDevice.current.isBatteryMonitoringEnabled = true
-        brightnessBeforeReading = Double(UIScreen.main.brightness)
-        if storedReaderBrightness > 0.05 {
-            followsSystemBrightness = false
-            readerBrightness = storedReaderBrightness
-            UIScreen.main.brightness = CGFloat(storedReaderBrightness)
-        } else {
-            readerBrightness = brightnessBeforeReading
-        }
-        backgroundImage = ReaderBackgroundStore.load()
-        ReaderScreenOrientation.apply(screenOrientation)
-        Task { await loadHTTPEngines() }
-        if ProcessInfo.processInfo.arguments.contains("-uiDemoBookmarks") {
-            showsBookmarks = true
-        }
-        if ProcessInfo.processInfo.arguments.contains("-uiDemoReaderMenu") {
-            showsReaderMenu = true
-        }
-        if ProcessInfo.processInfo.arguments.contains("-uiDemoReaderStyle") {
-            DispatchQueue.main.async { showsStyleControls = true }
-        }
-    }
-
     private func saveProgress(immediate: Bool = false) {
         guard let chapter = model.currentChapter else { return }
         let position = readerPosition
@@ -2068,6 +2049,15 @@ struct ReaderView: View {
     private func stopSpeechIfNeeded() {
         speechStartGeneration &+= 1
         if speech.isSpeaking || speech.isPaused { speech.toggle(text: "") }
+    }
+
+    private func stopSpeechForContentChange() {
+        speechStartGeneration &+= 1
+        resumesSpeechAfterChapterLoad = false
+        speech.stop()
+        speechTimerTask?.cancel()
+        speechTimerRemaining = 0
+        isAutoReading = false
     }
 
     private func restartSpeechAfterReaderLayoutChange() {
@@ -2174,10 +2164,17 @@ struct ReaderView: View {
     }
 
     private func prefetchNextChapterSpeech(engine: HttpTTS) {
+        let generation = model.chapterLoadGeneration
+        let speechGeneration = speechStartGeneration
+        let bookURL = model.book.bookUrl
+        let chapterIndex = model.currentIndex
         Task {
             guard let content = await model.nextSpeechContent(
-                rules: activeRules
-            ), selectedHTTPEngine?.id == engine.id else { return }
+                rules: model.usesReplaceRules ? replaceRules.rules : []
+            ), selectedHTTPEngine?.id == engine.id,
+               generation == model.chapterLoadGeneration,
+               speechGeneration == speechStartGeneration,
+               bookURL == model.book.bookUrl, chapterIndex == model.currentIndex else { return }
             speech.prefetchHTTP(engine: engine, text: content, limit: 10)
         }
     }
@@ -2270,9 +2267,23 @@ struct ReaderView: View {
             get: { model.book.readConfig?.ttsEngine ?? "__global__" },
             set: { value in
                 let updated = model.setTTSEngine(value == "__global__" ? nil : value)
-                Task { await library.addOrUpdate(updated) }
+                saveReaderSetting(updated) { $0.ttsEngine = updated.readConfig?.ttsEngine }
             }
         )
+    }
+
+    private func readerSettingErrorPresented(inSettings: Bool) -> Binding<Bool> {
+        Binding(get: { readerSettingSaveError != nil && showsReaderSettings == inSettings },
+                set: { if !$0 { readerSettingSaveError = nil } })
+    }
+
+    private func saveReaderSetting(_ updated: Book, change: @escaping (inout BookReadConfig) -> Void) {
+        guard library.contains(updated) else { return }
+        Task {
+            if !(await library.updateReadConfig(for: updated, change)) {
+                readerSettingSaveError = "本次设置仅在当前阅读中生效。" + (library.errorMessage ?? "书架记录已变化，请重新打开书籍后再试。")
+            }
+        }
     }
 
     private func loadHTTPEngines() async {

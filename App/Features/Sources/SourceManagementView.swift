@@ -16,6 +16,7 @@ struct SourceManagementView: View {
     @State private var searchText = ""
     @State private var isSelecting = false
     @State private var selectedSourceIDs = Set<String>()
+    @State private var confirmsBatchDelete = false
     @AppStorage("bookSourceSort") private var sortMode = "manual"
     @AppStorage("bookSourceSortDescending") private var sortDescending = false
 
@@ -53,15 +54,30 @@ struct SourceManagementView: View {
     }
 
     var body: some View {
-        Group {
+        VStack(spacing: 0) {
+            ReadingPillSearchField(placeholder: "名称、地址或分组", text: $searchText)
             if library.sources.isEmpty, !library.isWorking {
-                ReadingUnavailableView {
-                    Label("还没有书源", systemImage: "network")
-                } description: {
-                    Text("新建书源，或从文件、链接、JSON、二维码导入。")
-                } actions: {
-                    Button("导入书源", action: presentFileImporter)
-                        .readingProminentButtonStyle()
+                ReadingIllustratedEmptyState(
+                    artwork: "SourceEmptyArtwork",
+                    title: "还没有书源",
+                    message: "新建书源，或从文件、链接、JSON、二维码导入",
+                    bottomBalance: 116
+                ) {
+                    Menu {
+                        Button("新建书源", systemImage: "plus") { showsNewSource = true }
+                        Button("从文件导入", systemImage: "doc.badge.plus", action: presentFileImporter)
+                        Button("URL 或粘贴 JSON", systemImage: "link.badge.plus") { showsTextImporter = true }
+                        Button("二维码导入", systemImage: "qrcode.viewfinder") { showsQRImporter = true }
+                    } label: {
+                        Label("导入书源", systemImage: "plus")
+                            .font(.system(size: 15, weight: .medium))
+                            .padding(.horizontal, 28)
+                            .frame(minHeight: 38)
+                            .foregroundStyle(ReadingTheme.onAccent)
+                            .background(ReadingTheme.accentFill, in: Capsule())
+                    }
+                    .padding(.top, 26)
+                    .accessibilityIdentifier("sources.import")
                 }
             } else {
                 List {
@@ -130,18 +146,18 @@ struct SourceManagementView: View {
             }
         }
         .navigationTitle("书源")
-        .background(ReadingTheme.groupedCanvas)
-        .searchable(text: $searchText, prompt: "名称、地址或分组")
+        .background(ReadingTheme.canvas)
+        .navigationBarTitleDisplayMode(.inline)
+        .navigationBarHidden(false)
         .toolbar {
             ToolbarItem(placement: .topBarLeading) {
                 Button(isSelecting ? "完成" : "选择") {
                     isSelecting.toggle()
                     if !isSelecting { selectedSourceIDs.removeAll() }
                 }
-                .disabled(library.sources.isEmpty)
             }
             ToolbarItem(placement: .primaryAction) {
-                Menu("更多", systemImage: "ellipsis.circle") {
+                Menu("更多", systemImage: "ellipsis") {
                     Button("新建书源", systemImage: "plus") { showsNewSource = true }
                     Button("二维码导入", systemImage: "qrcode.viewfinder") { showsQRImporter = true }
                     Button("从文件导入", systemImage: "doc.badge.plus", action: presentFileImporter)
@@ -172,7 +188,7 @@ struct SourceManagementView: View {
         }
         .safeAreaInset(edge: .bottom) {
             if isSelecting {
-                HStack(spacing: 18) {
+                HStack(spacing: 12) {
                     Button(selectedSourceIDs.count == filteredSources.count ? "取消全选" : "全选") {
                         if selectedSourceIDs.count == filteredSources.count { selectedSourceIDs.removeAll() }
                         else { selectedSourceIDs = Set(filteredSources.map(\.id)) }
@@ -188,11 +204,24 @@ struct SourceManagementView: View {
                         Task { await library.setEnabled(false, for: selectedSourceIDs) }
                     }
                     .disabled(selectedSourceIDs.isEmpty)
+                    Button("删除", systemImage: "trash", role: .destructive) { confirmsBatchDelete = true }
+                        .disabled(selectedSourceIDs.isEmpty)
                 }
+                .labelStyle(.titleOnly)
                 .font(.subheadline.weight(.semibold))
                 .padding(.horizontal, 18).padding(.vertical, 12)
                 .background(.ultraThinMaterial)
             }
+        }
+        .alert("删除所选书源？", isPresented: $confirmsBatchDelete) {
+            Button("删除 \(selectedSourceIDs.count) 个", role: .destructive) {
+                let ids = selectedSourceIDs
+                selectedSourceIDs.removeAll()
+                Task { await library.remove(sourceIDs: ids) }
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("将删除已选的 \(selectedSourceIDs.count) 个书源，无法撤销。")
         }
         .sheet(isPresented: $showsNewSource) { SourceEditorView().environmentObject(library) }
         .sheet(isPresented: $showsQRImporter) {
